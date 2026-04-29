@@ -16,7 +16,6 @@ class DummyPipe:
     antialiasing = False 
 
 def get_model_vram_mb(gaussians):
-    """모델 파라미터들이 순수하게 차지하는 GPU 메모리 계산"""
     mem = 0
     for name, param in gaussians.__dict__.items():
         if isinstance(param, torch.Tensor) and param.is_cuda:
@@ -69,12 +68,10 @@ def render_compressed(model_path, views, gaussians, background, q_shs, sh_scale,
     os.makedirs(render_path, exist_ok=True)
     pipe = DummyPipe()
     
-    # 원본 FP32 데이터를 GPU에서 완전 삭제 후 정적 모델 메모리 측정
     del gaussians._features_dc
     del gaussians._features_rest
     torch.cuda.empty_cache()
     
-    # SH가 빠진 뼈대 모델 메모리 + 압축된 INT8 텐서 사이즈
     model_vram = get_model_vram_mb(gaussians) + (q_shs.element_size() * q_shs.nelement() / (1024**2))
     
     torch.cuda.reset_peak_memory_stats()
@@ -82,15 +79,12 @@ def render_compressed(model_path, views, gaussians, background, q_shs, sh_scale,
     
     start_time = time.time()
     for idx, view in enumerate(views):
-        # 1. 병렬 역양자화 (Materialize)
         dequantized_shs = dequantize_cuda.dequantize(q_shs, sh_scale, sh_zp).view(-1, 16, 3)
         gaussians._features_dc = dequantized_shs[:, 0:1, :]
         gaussians._features_rest = dequantized_shs[:, 1:16, :]
             
-        # 2. 렌더링
         rendering = render(view, gaussians, pipe, background)["render"]
         
-        # 3. 프레임 렌더링 직후 사용된 임시 FP32 메모리 해제
         gaussians._features_dc = None
         gaussians._features_rest = None
         del dequantized_shs
