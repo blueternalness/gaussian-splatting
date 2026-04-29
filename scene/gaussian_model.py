@@ -471,3 +471,49 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def quantize_shs(self):
+        """
+        Offline Compression: SH 계수(float32)를 int8로 양자화하고 SoA 형태로 변환합니다.
+        """
+        # SH 데이터 가져오기: [N, 16, 3] -> [N, 48]
+        shs = self.get_features.detach().view(self._features_dc.shape[0], -1)
+        
+        # 제안서 핵심: Memory Coalescing을 위한 SoA(Structure of Arrays) 변환
+        # [N, 48] -> [48, N] 형태로 Transpose 하여 동일한 SH 계수가 메모리에 연속적으로 위치하게 함
+        shs_soa = shs.t().contiguous()
+
+        # Channel별(또는 coefficient별) Min-Max 양자화 (Symmetric or Asymmetric)
+        # 차원: [48, 1]
+        self.sh_min = shs_soa.min(dim=1, keepdim=True)[0]
+        self.sh_max = shs_soa.max(dim=1, keepdim=True)[0]
+        
+        # Scale 및 Zero-point 계산 (int8 범위: -128 ~ 127)
+        self.sh_scale = (self.sh_max - self.sh_min) / 255.0
+        # 0 나누기 방지
+        self.sh_scale[self.sh_scale == 0] = 1e-5 
+        self.sh_zero_point = torch.round(-self.sh_min / self.sh_scale) - 128.0
+
+        # 양자화 수행: (value / scale) + zero_point
+        shs_q = torch.round(shs_soa / self.sh_scale + self.sh_zero_point)
+        shs_q = torch.clamp(shs_q, -128, 127).to(torch.int8)
+
+        # 기존 메모리 반환 및 양자화된 데이터 저장
+        self._features_dc = None
+        self._features_rest = None
+        self.quantized_shs = shs_q # [48, N] int8 tensor
+
+    def save_compressed_ply(self, path):
+        """양자화된 파라미터들을 디스크에 저장하여 VRAM 및 디스크 용량을 줄입니다."""
+        # xyz, opacity, scaling, rotation 등은 float16이나 기존 형태로 저장
+        # SH는 int8 형태로, scale/zero_point와 함께 저장
+        np.savez_compressed(
+            path,
+            xyz=self.get_xyz.detach().cpu().numpy(),
+            opacity=self.get_opacity.detach().cpu().numpy(),
+            scaling=self.get_scaling.detach().cpu().numpy(),
+            rotation=self.get_rotation.detach().cpu().numpy(),
+            shs_q=self.quantized_shs.cpu().numpy(),
+            sh_scale=self.sh_scale.cpu().numpy(),
+            sh_zp=self.sh_zero_point.cpu().numpy()
+        )
